@@ -1,0 +1,165 @@
+#!/usr/bin/python3.5
+import os
+import sys
+import csv
+import glob
+import dateutil.parser as parser
+import smartsheet
+
+mss_sheet_fields = ['Current Production Status', 'QC Completed Date', 'QC Failed Metrics',
+                    'Sample Full Name', 'Work Order ID']
+
+cwd = os.getcwd()
+
+if not os.path.isfile(sys.argv[1]):
+    sys.exit('{} file not found'.format(sys.argv[1]))
+
+
+def get_admin_mss_sheets(admin_project):
+
+    # get workspace id
+    for space in ss_connector.Workspaces.list_workspaces(include_all=True).data:
+
+        if 'Smartflow Production Workspace' in space.name:
+            workspace_id = space.id
+
+    # get admin folder id
+    for folders in ss_connector.Workspaces.get_workspace(workspace_id).folders:
+        if 'Admin Projects' in folders.name:
+            admin_folder_id = folders.id
+
+    # get active projects folder id
+    for folders in ss_connector.Folders.get_folder(admin_folder_id).folders:
+        if 'Active Projects' in folders.name:
+            active_projects_folder_id = folders.id
+
+    # for all the folders in Active projects get all the sheet ids, add to a list
+    population_admin_projects_folder_id_name = {}
+    for folders in ss_connector.Folders.get_folder(active_projects_folder_id).folders:
+        if admin_project in folders.name:
+            population_admin_projects_folder_id_name[folders.id] = folders.name
+
+    # get mss sheet ids
+    admin_project_sheet_ids = {}
+
+    for folder_id in population_admin_projects_folder_id_name:
+        admin_project_sheet_ids[population_admin_projects_folder_id_name[folder_id]] = []
+
+        for sheets in ss_connector.Folders.get_folder(folder_id).sheets:
+            admin_project_sheet_ids[population_admin_projects_folder_id_name[folder_id]].append(sheets.id)
+
+    return admin_project_sheet_ids
+
+
+def get_column_ids(id_):
+
+    sheet_col_ids = {}
+    for col in ss_connector.Sheets.get_columns(id_).data:
+        if col.title in mss_sheet_fields:
+            sheet_col_ids[col.title] = col.id
+
+    return sheet_col_ids
+
+
+# get sample qc data
+with open(sys.argv[1], 'r') as pf:
+    pf_reader = csv.DictReader(pf, delimiter='\t')
+
+    qc_data = {}
+    for line in pf_reader:
+
+        if line['Collection'] not in qc_data:
+            qc_data[line['Collection']] = {}
+
+        qc_data[line['Collection']][line['WOID']] = {}
+
+        for key, value in line.items():
+            qc_data[line['Collection']][line['WOID']][key] = value
+
+        if os.path.isdir('{}/attachments/'.format(qc_data[line['Collection']][line['WOID']]['QC Directory'])):
+            os.chdir('{}/attachments/'.format(qc_data[line['Collection']][line['WOID']]['QC Directory']))
+            all_file = glob.glob('*all.tsv')
+
+            if len(all_file) == 1:
+                with open(all_file[0], 'r') as af:
+                    af_reader = csv.DictReader(af, delimiter='\t')
+                    for l in af_reader:
+                        date = parser.parse(l['date_QC']).isoformat()
+                        status = 'QC Pass'
+                        if l['STATUS'] == 'fail':
+                            status = 'QC Fail'
+
+                        qc_data[line['Collection']][line['WOID']][l['DNA']] = {'Current Production Status': status,
+                                                                               'QC Failed Metrics':
+                                                                                   l['QC Failed Metrics'],
+                                                                               'QC Completed Date': date}
+
+            else:
+                sys.exit('Multiple *all* files found {} exiting.'.format(os.getcwd()))
+
+        os.chdir(cwd)
+
+
+# open smartsheet connection
+ss_connector = smartsheet.Smartsheet(os.environ.get('SMRT_API'))
+ss_connector.errors_as_exceptions()
+
+# get mss sheets
+print('Uploading QC metrics from {} to Smartflow Production Workspace.'.format(sys.argv[1]))
+for admin in qc_data:
+
+    print('Admin Project: ', admin)
+
+    admin_mss_sheets = get_admin_mss_sheets(admin)
+
+    for sheet_id in admin_mss_sheets[admin]:
+
+        # get column id's
+        sheet_column_ids_dict = get_column_ids(sheet_id)
+
+        # get sheet
+        mss_sheet = ss_connector.Sheets.get_sheet(sheet_id=sheet_id, column_ids=list(sheet_column_ids_dict.values()))
+
+        print('MSS Sheet: ', mss_sheet.name)
+
+        updated_rows = []
+
+        for row in mss_sheet.rows:
+
+            sample = False
+            woid = False
+            add_new_row = False
+
+            for cell in row.cells:
+
+                if cell.column_id == sheet_column_ids_dict['Sample Full Name']:
+                    sample = cell.value
+
+                if cell.column_id == sheet_column_ids_dict['Work Order ID']:
+                    woid = cell.value
+
+            # find row to update
+            if woid in qc_data[admin] and sample in qc_data[admin][woid]:
+
+                # make new row
+                new_row = ss_connector.models.Row()
+                new_row.id = row.id
+
+                # update cells
+                for field in mss_sheet_fields:
+
+                    if field in ['Sample Full Name', 'Work Order ID']:
+                        continue
+
+                    new_cell = ss_connector.models.Cell()
+                    new_cell.column_id = sheet_column_ids_dict[field]
+                    new_cell.value = qc_data[admin][woid][sample][field]
+                    new_row.cells.append(new_cell)
+
+                updated_rows.append(new_row)
+
+        print('Number of samples updated: {}\n'.format(len(updated_rows)))
+        if len(updated_rows) > 0:
+            ss_connector.Sheets.update_rows(sheet_id, updated_rows)
+
+print('ss_qc sample update complete.')
