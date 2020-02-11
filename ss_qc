@@ -128,7 +128,7 @@ for admin in qc_data:
 
             sample = False
             woid = False
-            add_new_row = False
+            add_new_row = True
 
             for cell in row.cells:
 
@@ -138,8 +138,12 @@ for admin in qc_data:
                 if cell.column_id == sheet_column_ids_dict['Work Order ID']:
                     woid = cell.value
 
+                if cell.column_id == sheet_column_ids_dict['Current Production Status']:
+                    if cell.value in ['QC WGS AWO', 'QC Exome AWO']:
+                        add_new_row = False
+
             # find row to update
-            if woid in qc_data[admin] and sample in qc_data[admin][woid]:
+            if woid in qc_data[admin] and sample in qc_data[admin][woid] and add_new_row:
 
                 # make new row
                 new_row = ss_connector.models.Row()
